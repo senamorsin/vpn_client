@@ -24,7 +24,6 @@ class ConnectOptions:
     verbose: bool = False
     dry_run: bool = False
     cleanup_on_exit: bool = False
-    force_default_route: bool = True
     core_cmd: str = ""
 
 
@@ -53,8 +52,6 @@ def build_connect_command(options: ConnectOptions) -> list[str]:
         cmd.append("--dry-run")
     if options.cleanup_on_exit:
         cmd.append("--cleanup-on-exit")
-    if options.force_default_route:
-        cmd.append("--force-default-route")
     if options.allow_lan.strip():
         cmd += ["--allow-lan", options.allow_lan.strip()]
 
@@ -70,16 +67,12 @@ def build_connect_command(options: ConnectOptions) -> list[str]:
     return cmd
 
 
-def build_disconnect_command(mode: str, dry_run: bool = False, log_file: str = "", verbose: bool = False, force_default_route: bool = False, tunnel_iface: str = "") -> list[str]:
+def build_disconnect_command(mode: str, dry_run: bool = False, log_file: str = "", verbose: bool = False) -> list[str]:
     cmd = [sys.executable, "hard_vless_client.py", "disconnect", "--mode", mode]
     if log_file:
         cmd += ["--log-file", log_file]
     if verbose:
         cmd.append("--verbose")
-    if force_default_route:
-        cmd.append("--force-default-route")
-        if tunnel_iface.strip():
-            cmd += ["--tunnel-iface", tunnel_iface.strip()]
     if dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -148,7 +141,6 @@ if PYQT_IMPORT_ERROR is None:
             self.log_output.setPlaceholderText("Logs and command output will appear here...")
             layout.addWidget(self.log_output, stretch=1)
 
-            self.clear_btn.clicked.connect(self.log_output.clear)
             self._on_mode_changed(self.mode_box.currentText())
 
         def _build_config_box(self) -> QWidget:
@@ -159,7 +151,7 @@ if PYQT_IMPORT_ERROR is None:
             self.protocol_box.addItems(["vless", "vmess", "trojan", "shadowsocks", "hysteria2"])
 
             self.mode_box = QComboBox()
-            self.mode_box.addItems(["tun", "system-proxy", "tun-system-proxy"])
+            self.mode_box.addItems(["tun", "system-proxy"])
             self.mode_box.currentTextChanged.connect(self._on_mode_changed)
 
             self.server_ip_edit = QLineEdit("203.0.113.10")
@@ -205,13 +197,10 @@ if PYQT_IMPORT_ERROR is None:
             self.verbose_chk = QCheckBox("Verbose")
             self.dry_run_chk = QCheckBox("Dry run")
             self.cleanup_chk = QCheckBox("Cleanup on exit")
-            self.force_route_chk = QCheckBox("Force default route via TUN")
-            self.force_route_chk.setChecked(True)
             flags = QHBoxLayout()
             flags.addWidget(self.verbose_chk)
             flags.addWidget(self.dry_run_chk)
             flags.addWidget(self.cleanup_chk)
-            flags.addWidget(self.force_route_chk)
             flags.addStretch(1)
             form.addRow("Allow LAN CIDRs", self.allow_lan_edit)
             form.addRow("Log file", self.log_file_edit)
@@ -226,6 +215,7 @@ if PYQT_IMPORT_ERROR is None:
             self.clear_btn = QPushButton("Clear Logs")
             self.connect_btn.clicked.connect(self.on_connect)
             self.disconnect_btn.clicked.connect(self.on_disconnect)
+            self.clear_btn.clicked.connect(self.log_output.clear)
             row.addWidget(self.connect_btn)
             row.addWidget(self.disconnect_btn)
             row.addWidget(self.clear_btn)
@@ -233,12 +223,10 @@ if PYQT_IMPORT_ERROR is None:
             return row
 
         def _on_mode_changed(self, mode: str) -> None:
-            tun = mode in ("tun", "tun-system-proxy")
-            proxy = mode in ("system-proxy", "tun-system-proxy")
+            tun = mode == "tun"
             self.tunnel_iface_edit.setEnabled(tun)
-            self.proxy_host_edit.setEnabled(proxy)
-            self.proxy_port_spin.setEnabled(proxy)
-            self.force_route_chk.setEnabled(tun)
+            self.proxy_host_edit.setEnabled(not tun)
+            self.proxy_port_spin.setEnabled(not tun)
 
         def _append(self, text: str) -> None:
             self.log_output.append(text.rstrip())
@@ -280,7 +268,6 @@ if PYQT_IMPORT_ERROR is None:
                 verbose=self.verbose_chk.isChecked(),
                 dry_run=self.dry_run_chk.isChecked(),
                 cleanup_on_exit=self.cleanup_chk.isChecked(),
-                force_default_route=self.force_route_chk.isChecked(),
                 core_cmd=self.core_cmd_edit.text().strip(),
             )
             if not opts.server_ip:
@@ -297,8 +284,6 @@ if PYQT_IMPORT_ERROR is None:
                 dry_run=self.dry_run_chk.isChecked(),
                 log_file=self.log_file_edit.text().strip(),
                 verbose=self.verbose_chk.isChecked(),
-                force_default_route=self.force_route_chk.isChecked(),
-                tunnel_iface=self.tunnel_iface_edit.text().strip(),
             )
             self._append("$ " + shlex.join(cmd))
             try:

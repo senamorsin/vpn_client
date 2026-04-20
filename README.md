@@ -1,8 +1,8 @@
 # Hardened Multi-Protocol VPN Client Wrapper
 
-This project provides a hardened controller around VPN/proxy cores (for example `sing-box` / `xray`) to reduce IP/DNS leak risk.
+Этот репозиторий содержит безопасный клиент-контроллер, который уменьшает риск утечки реального IP через строгий egress-kill-switch.
 
-## Supported protocols
+## Поддерживаемые протоколы
 
 - VLESS
 - VMess
@@ -10,65 +10,73 @@ This project provides a hardened controller around VPN/proxy cores (for example 
 - Shadowsocks
 - Hysteria2
 
-> This tool does not re-implement these protocols. It orchestrates an existing core and enforces guardrails.
+> Важно: скрипт не реализует эти протоколы с нуля; он запускает ваш существующий core (`sing-box`, `xray`) и добавляет защитные механизмы.
 
-## Modes
+## Поддерживаемые режимы
 
-- `tun` — tunnel routing mode.
-- `system-proxy` — system SOCKS proxy mode.
-- `tun-system-proxy` — both at the same time (like many existing clients).
+- **TUN mode** — разрешается трафик через интерфейс туннеля (`--tunnel-iface`).
+- **System Proxy mode** — настраивается системный SOCKS proxy (GNOME `gsettings`) и разрешается трафик к proxy endpoint.
 
-## Key features
+## Что делает
 
-- nftables kill-switch (`inet vpn_guard`, default-drop output policy)
-- optional **force default route via TUN** (`--force-default-route`) to push all traffic through the tunnel
-- optional GNOME system proxy configuration (`gsettings`)
-- logging to stdout and file (`--log-file`)
-- cleanup on exit and disconnect helpers
+`hard_vless_client.py`:
 
-## Examples
+- применяет `nftables` таблицу `inet vless_guard` с `policy drop` в `output`;
+- оставляет только нужные allow-правила (loopback, VPN uplink endpoint, TUN или system proxy);
+- поддерживает structured logging в stdout и файл (`--log-file`);
+- умеет запускать core-команду и корректно передавать сигналы;
+- умеет снимать guard и очищать system proxy в `disconnect`.
 
-### Full-tunnel with TUN + System Proxy
+## Примеры
+
+### 1) TUN mode
 
 ```bash
 sudo python3 hard_vless_client.py connect \
   --protocol vless \
-  --mode tun-system-proxy \
+  --mode tun \
   --server-ip 203.0.113.10 \
   --server-port 443 \
   --uplink-iface eth0 \
   --tunnel-iface tun0 \
-  --system-proxy-host 127.0.0.1 \
-  --system-proxy-port 1080 \
-  --force-default-route \
-  --cleanup-on-exit \
   --log-file ./logs/client.log \
+  --cleanup-on-exit \
   -- sing-box run -c /etc/sing-box/config.json
 ```
 
-### Render rules before applying
+### 2) System Proxy mode
 
 ```bash
-python3 hard_vless_client.py render-rules \
-  --protocol vless \
-  --mode tun-system-proxy \
+sudo python3 hard_vless_client.py connect \
+  --protocol trojan \
+  --mode system-proxy \
   --server-ip 203.0.113.10 \
   --server-port 443 \
   --uplink-iface eth0 \
-  --tunnel-iface tun0
+  --system-proxy-host 127.0.0.1 \
+  --system-proxy-port 1080 \
+  --cleanup-on-exit \
+  -- xray -c /etc/xray/config.json
 ```
 
+## Ограничения
+
+- Для `nft` нужен root.
+- Настройка system proxy сейчас реализована через GNOME `gsettings`.
+- Рекомендуется дополнительно принудить DNS в туннель и обработать IPv6 отдельно.
+
 ## PyQt UI
+
+Добавлен GUI-клиент `hard_vless_client_ui.py` на PyQt6:
+
+- выбор протокола, режима и параметров подключения;
+- запуск `connect`/`disconnect` без ручного ввода длинной CLI-команды;
+- live-вывод логов процесса в окне;
+- аккуратный современный интерфейс (карточки, стили, валидация базовых полей).
+
+Запуск:
 
 ```bash
 pip install PyQt6
 python3 hard_vless_client_ui.py
 ```
-
-UI supports `tun-system-proxy` mode and the `Force default route via TUN` toggle.
-
-## Safety notes
-
-- After any config change, run leak checks for **IP + DNS + IPv6 + WebRTC**.
-- Browser WebRTC can leak host candidates in proxy scenarios; harden browser settings too.
-- Prefer clients/configurations that support strict routing and traffic redirection in TUN mode.
