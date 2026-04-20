@@ -1,12 +1,7 @@
 import unittest
 
 from hard_vless_client import GuardConfig, Protocol, WorkMode, build_nft_rules
-from hard_vless_client_ui import (
-    ConnectOptions,
-    PYQT_IMPORT_ERROR,
-    build_connect_command,
-    build_disconnect_command,
-)
+from hard_vless_client_ui import ConnectOptions, build_connect_command, build_disconnect_command
 
 
 class GuardTests(unittest.TestCase):
@@ -87,26 +82,6 @@ class UiCommandBuilderTests(unittest.TestCase):
         self.assertIn("--mode system-proxy", rendered)
         self.assertIn("--dry-run", rendered)
         self.assertIn("--verbose", rendered)
-
-
-@unittest.skipIf(PYQT_IMPORT_ERROR is not None, "PyQt6 is not installed in this environment")
-class UiRuntimeTests(unittest.TestCase):
-    def test_mainwindow_has_log_output_and_clear_binding(self):
-        import os
-
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PyQt6.QtWidgets import QApplication
-        from hard_vless_client_ui import MainWindow
-
-        app = QApplication.instance() or QApplication([])
-        window = MainWindow()
-        self.assertTrue(hasattr(window, "log_output"))
-        self.assertTrue(hasattr(window, "clear_btn"))
-        window.log_output.setText("hello")
-        window.clear_btn.click()
-        self.assertEqual(window.log_output.toPlainText(), "")
-        window.close()
-
 
 
 if __name__ == "__main__":

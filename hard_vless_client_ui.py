@@ -141,7 +141,6 @@ if PYQT_IMPORT_ERROR is None:
             self.log_output.setPlaceholderText("Logs and command output will appear here...")
             layout.addWidget(self.log_output, stretch=1)
 
-            self.clear_btn.clicked.connect(self.log_output.clear)
             self._on_mode_changed(self.mode_box.currentText())
 
         def _build_config_box(self) -> QWidget:
@@ -216,6 +215,7 @@ if PYQT_IMPORT_ERROR is None:
             self.clear_btn = QPushButton("Clear Logs")
             self.connect_btn.clicked.connect(self.on_connect)
             self.disconnect_btn.clicked.connect(self.on_disconnect)
+            self.clear_btn.clicked.connect(self.log_output.clear)
             row.addWidget(self.connect_btn)
             row.addWidget(self.disconnect_btn)
             row.addWidget(self.clear_btn)
