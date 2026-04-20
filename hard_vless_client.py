@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Hardened multi-protocol VPN client wrapper with leak-prevention controls.
-
-The tool does not implement protocols itself; it wraps an existing core process
-(e.g. sing-box / xray) and applies strict egress policy + optional system proxy
-configuration.
-"""
+"""Hardened multi-protocol VPN client wrapper with leak-prevention controls."""
 
 from __future__ import annotations
 
@@ -21,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
-TABLE_NAME = "vless_guard"
+TABLE_NAME = "vpn_guard"
 
 
 class Protocol(str, Enum):
@@ -35,6 +30,7 @@ class Protocol(str, Enum):
 class WorkMode(str, Enum):
     TUN = "tun"
     SYSTEM_PROXY = "system-proxy"
+    TUN_SYSTEM_PROXY = "tun-system-proxy"
 
 
 @dataclass(frozen=True)
@@ -48,6 +44,7 @@ class GuardConfig:
     system_proxy_host: str = "127.0.0.1"
     system_proxy_port: int = 1080
     allow_lan_cidr: tuple[str, ...] = ()
+    force_default_route: bool = False
 
     def validate(self) -> None:
         ipaddress.ip_address(self.server_ip)
@@ -56,10 +53,10 @@ class GuardConfig:
         if not self.uplink_iface:
             raise ValueError("uplink_iface is required")
 
-        if self.mode == WorkMode.TUN and not self.tunnel_iface:
+        if self.mode in (WorkMode.TUN, WorkMode.TUN_SYSTEM_PROXY) and not self.tunnel_iface:
             raise ValueError("tunnel_iface is required for tun mode")
 
-        if self.mode == WorkMode.SYSTEM_PROXY:
+        if self.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
             ipaddress.ip_address(self.system_proxy_host)
             if not (1 <= self.system_proxy_port <= 65535):
                 raise ValueError("system_proxy_port must be in range 1..65535")
@@ -88,17 +85,38 @@ def setup_logger(log_file: str | None, verbose: bool) -> logging.Logger:
     return logger
 
 
+def _allow_mode_lines(cfg: GuardConfig) -> str:
+    lines: list[str] = []
+
+    if cfg.mode in (WorkMode.TUN, WorkMode.TUN_SYSTEM_PROXY):
+        lines.append(f'  oifname "{cfg.tunnel_iface}" accept')
+
+    if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
+        lines.append(
+            f"  ip daddr {cfg.system_proxy_host} tcp dport {cfg.system_proxy_port} accept"
+        )
+
+    return "\n".join(lines)
+
+
+
+def _allow_mode_lines_v6(cfg: GuardConfig) -> str:
+    lines: list[str] = []
+    if cfg.mode in (WorkMode.TUN, WorkMode.TUN_SYSTEM_PROXY):
+        lines.append(f'  oifname "{cfg.tunnel_iface}" accept')
+    if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY) and cfg.system_proxy_host == "::1":
+        lines.append(
+            f"  ip6 daddr {cfg.system_proxy_host} tcp dport {cfg.system_proxy_port} accept"
+        )
+    return "\n".join(lines)
+
 def build_nft_rules(cfg: GuardConfig) -> str:
     allow_lan_lines = "\n".join(
         f"  ip daddr {cidr} accept" for cidr in cfg.allow_lan_cidr
     )
 
-    mode_allow = (
-        f'  oifname "{cfg.tunnel_iface}" accept\n'
-        if cfg.mode == WorkMode.TUN
-        else "  # System proxy mode: direct egress allowed only to proxy endpoint.\n"
-        f"  ip daddr {cfg.system_proxy_host} tcp dport {cfg.system_proxy_port} accept\n"
-    )
+    mode_lines = _allow_mode_lines(cfg)
+    mode_lines_v6 = _allow_mode_lines_v6(cfg)
 
     return f"""
 flush table inet {TABLE_NAME}
@@ -111,14 +129,33 @@ table inet {TABLE_NAME} {{
   oifname \"lo\" accept
 
   # Work mode policy.
-{mode_allow.rstrip()}
+{mode_lines if mode_lines else '  # no mode-specific allow rules'}
 
-  # Allow connection to upstream VPN server (control/data plane to uplink).
+  # Allow control/data channel to upstream VPN server on uplink.
   oifname \"{cfg.uplink_iface}\" ip daddr {cfg.server_ip} tcp dport {cfg.server_port} accept
   oifname \"{cfg.uplink_iface}\" ip daddr {cfg.server_ip} udp dport {cfg.server_port} accept
 
+  # Block local DNS leaks except loopback resolver.
+  ip daddr != 127.0.0.1 udp dport 53 drop
+  ip daddr != 127.0.0.1 tcp dport 53 drop
+
   # Optional local network access.
 {allow_lan_lines if allow_lan_lines else '  # (no LAN CIDRs configured)'}
+ }}
+
+ chain output_v6 {{
+  type filter hook output priority 0;
+  policy drop;
+
+  ct state established,related accept
+  oifname "lo" accept
+
+  # Work mode policy (IPv6).
+{mode_lines_v6 if mode_lines_v6 else '  # no IPv6 mode-specific allow rules'}
+
+  # deny IPv6 DNS when not explicitly tunneled
+  ip6 daddr ::1 udp dport 53 accept
+  ip6 daddr ::1 tcp dport 53 accept
  }}
 }}
 """.strip() + "\n"
@@ -140,53 +177,78 @@ def clear_nft(dry_run: bool = False, logger: logging.Logger | None = None) -> No
     if dry_run:
         print(shlex.join(cmd))
         if logger:
-            logger.info("Dry-run: nft table delete command printed")
+            logger.info("Dry-run: nft delete table command printed")
         return
     subprocess.run(cmd, check=False)
     if logger:
         logger.info("Removed nftables guard table")
 
 
-def configure_system_proxy(
-    host: str,
-    port: int,
-    dry_run: bool,
-    logger: logging.Logger,
-) -> None:
-    """Configure GNOME proxy settings if gsettings exists."""
+def run_command(cmd: list[str], dry_run: bool, logger: logging.Logger, ignore_error: bool = False) -> bool:
+    if dry_run:
+        print(shlex.join(cmd))
+        logger.info("Dry-run command: %s", shlex.join(cmd))
+        return True
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0 and not ignore_error:
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+    if result.returncode != 0 and ignore_error:
+        logger.warning("Command failed but ignored (%s): %s", result.returncode, shlex.join(cmd))
+        return False
+    return True
+
+
+def get_default_routes(family: str) -> list[str]:
+    out = subprocess.run(
+        ["ip", family, "route", "show", "default"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def force_default_route_to_tun(cfg: GuardConfig, dry_run: bool, logger: logging.Logger) -> tuple[list[str], list[str]]:
+    """Force default traffic through TUN and return previous routes for rollback."""
+    saved_v4 = get_default_routes("-4")
+    saved_v6 = get_default_routes("-6")
+
+    run_command(["ip", "-4", "route", "replace", "default", "dev", cfg.tunnel_iface], dry_run, logger)
+    run_command(["ip", "-6", "route", "replace", "default", "dev", cfg.tunnel_iface], dry_run, logger, ignore_error=True)
+
+    logger.info("Default routes forced through %s", cfg.tunnel_iface)
+    return saved_v4, saved_v6
+
+
+def restore_default_routes(saved_v4: list[str], saved_v6: list[str], dry_run: bool, logger: logging.Logger) -> None:
+    for line in saved_v4:
+        run_command(["ip", "-4", "route", "replace", *line.split()], dry_run, logger)
+    for line in saved_v6:
+        run_command(["ip", "-6", "route", "replace", *line.split()], dry_run, logger, ignore_error=True)
+    logger.info("Default routes restored")
+
+
+def configure_system_proxy(host: str, port: int, dry_run: bool, logger: logging.Logger) -> None:
     cmds = [
         ["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"],
         ["gsettings", "set", "org.gnome.system.proxy.socks", "host", host],
         ["gsettings", "set", "org.gnome.system.proxy.socks", "port", str(port)],
     ]
 
-    if dry_run:
-        for cmd in cmds:
-            print(shlex.join(cmd))
-        logger.info("Dry-run: system proxy commands printed")
-        return
-
     if not shutil_which("gsettings"):
         logger.warning("gsettings not found; skipping system proxy setup")
         return
 
     for cmd in cmds:
-        subprocess.run(cmd, check=True)
+        run_command(cmd, dry_run, logger)
     logger.info("Configured system proxy to %s:%s", host, port)
 
 
 def clear_system_proxy(dry_run: bool, logger: logging.Logger) -> None:
-    cmd = ["gsettings", "set", "org.gnome.system.proxy", "mode", "none"]
-    if dry_run:
-        print(shlex.join(cmd))
-        logger.info("Dry-run: clear system proxy command printed")
-        return
-
     if not shutil_which("gsettings"):
         logger.warning("gsettings not found; skipping system proxy cleanup")
         return
-
-    subprocess.run(cmd, check=False)
+    run_command(["gsettings", "set", "org.gnome.system.proxy", "mode", "none"], dry_run, logger)
     logger.info("System proxy disabled")
 
 
@@ -220,6 +282,16 @@ def run_core(command: list[str], logger: logging.Logger) -> int:
     return exit_code
 
 
+def safety_warnings(cfg: GuardConfig, logger: logging.Logger) -> None:
+    if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
+        logger.warning(
+            "Browser WebRTC may still expose host candidates; disable/limit WebRTC in browser settings."
+        )
+    logger.warning(
+        "Validate with IPv4/IPv6/DNS leak tests after each config change; IPv6 leakage is common on IPv4-only tunnels."
+    )
+
+
 def build_config(args: argparse.Namespace) -> GuardConfig:
     return GuardConfig(
         protocol=Protocol(args.protocol),
@@ -231,6 +303,7 @@ def build_config(args: argparse.Namespace) -> GuardConfig:
         system_proxy_host=args.system_proxy_host,
         system_proxy_port=args.system_proxy_port,
         allow_lan_cidr=parse_lan(args.allow_lan),
+        force_default_route=args.force_default_route,
     )
 
 
@@ -239,17 +312,19 @@ def cmd_connect(args: argparse.Namespace) -> int:
     cfg = build_config(args)
     cfg.validate()
     logger.info("Connect requested: protocol=%s mode=%s", cfg.protocol.value, cfg.mode.value)
+    safety_warnings(cfg, logger)
+
+    saved_v4: list[str] = []
+    saved_v6: list[str] = []
 
     rules = build_nft_rules(cfg)
     apply_nft(rules, dry_run=args.dry_run, logger=logger)
 
-    if cfg.mode == WorkMode.SYSTEM_PROXY:
-        configure_system_proxy(
-            host=cfg.system_proxy_host,
-            port=cfg.system_proxy_port,
-            dry_run=args.dry_run,
-            logger=logger,
-        )
+    if cfg.force_default_route and cfg.mode in (WorkMode.TUN, WorkMode.TUN_SYSTEM_PROXY):
+        saved_v4, saved_v6 = force_default_route_to_tun(cfg, args.dry_run, logger)
+
+    if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
+        configure_system_proxy(cfg.system_proxy_host, cfg.system_proxy_port, args.dry_run, logger)
 
     if not args.core_cmd:
         logger.info("Guard applied; no core command specified")
@@ -259,15 +334,24 @@ def cmd_connect(args: argparse.Namespace) -> int:
         return run_core(args.core_cmd, logger)
     finally:
         if args.cleanup_on_exit:
-            if cfg.mode == WorkMode.SYSTEM_PROXY:
+            if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
                 clear_system_proxy(dry_run=args.dry_run, logger=logger)
+            if cfg.force_default_route and cfg.mode in (WorkMode.TUN, WorkMode.TUN_SYSTEM_PROXY):
+                restore_default_routes(saved_v4, saved_v6, args.dry_run, logger)
             clear_nft(dry_run=args.dry_run, logger=logger)
 
 
 def cmd_disconnect(args: argparse.Namespace) -> int:
     logger = setup_logger(args.log_file, args.verbose)
-    if args.mode == WorkMode.SYSTEM_PROXY.value:
+
+    if args.mode in (WorkMode.SYSTEM_PROXY.value, WorkMode.TUN_SYSTEM_PROXY.value):
         clear_system_proxy(dry_run=args.dry_run, logger=logger)
+
+    if args.force_default_route and args.tunnel_iface:
+        # best-effort: remove forced route by dropping tunnel default if present
+        run_command(["ip", "-4", "route", "del", "default", "dev", args.tunnel_iface], args.dry_run, logger)
+        run_command(["ip", "-6", "route", "del", "default", "dev", args.tunnel_iface], args.dry_run, logger, ignore_error=True)
+
     clear_nft(dry_run=args.dry_run, logger=logger)
     return 0
 
@@ -294,6 +378,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--system-proxy-host", default="127.0.0.1")
     parser.add_argument("--system-proxy-port", default=1080, type=int)
     parser.add_argument("--allow-lan", default="", help="Comma-separated CIDRs")
+    parser.add_argument("--force-default-route", action="store_true", help="Route all traffic via tunnel interface")
     parser.add_argument("--dry-run", action="store_true")
 
 
@@ -315,6 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
     disconnect = sub.add_parser("disconnect", help="Remove guard and optional proxy")
     _add_global(disconnect)
     disconnect.add_argument("--mode", choices=[m.value for m in WorkMode], required=True)
+    disconnect.add_argument("--tunnel-iface", default="")
+    disconnect.add_argument("--force-default-route", action="store_true")
     disconnect.add_argument("--dry-run", action="store_true")
     disconnect.set_defaults(func=cmd_disconnect)
 
