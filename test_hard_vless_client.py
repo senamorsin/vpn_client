@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import patch
+from pathlib import Path
 
-from hard_vless_client import GuardConfig, Protocol, WorkMode, build_nft_rules
+from hard_vless_client import GuardConfig, Protocol, WorkMode, build_nft_rules, build_parser, core_binary_from_command, ensure_core_available, normalize_core_cmd, setup_logger, wait_for_expected_public_ip
 from hard_vless_client_ui import (
     ConnectOptions,
     PYQT_IMPORT_ERROR,
@@ -79,6 +81,8 @@ class UiCommandBuilderTests(unittest.TestCase):
         self.assertIn("--mode tun", rendered)
         self.assertIn("--tunnel-iface tun0", rendered)
         self.assertIn("xray", rendered)
+        self.assertIn("--auto-install-core", rendered)
+        self.assertIn("--verify-egress-ip", rendered)
 
     def test_build_disconnect_command(self):
         cmd = build_disconnect_command(mode="system-proxy", dry_run=True, verbose=True, force_default_route=True, tunnel_iface="tun0")
@@ -127,6 +131,75 @@ class HybridModeTests(unittest.TestCase):
         self.assertIn("--tunnel-iface tun0", rendered)
         self.assertIn("--system-proxy-host 127.0.0.1", rendered)
         self.assertIn("--system-proxy-port 1080", rendered)
+        self.assertIn("--auto-install-core", rendered)
+
+
+
+
+
+
+
+class EgressVerificationTests(unittest.TestCase):
+    def test_wait_for_expected_public_ip_success(self):
+        logger = setup_logger("", False)
+        with patch("hard_vless_client.get_public_ip", side_effect=["10.0.0.1", "203.0.113.10"]):
+            ok = wait_for_expected_public_ip(
+                expected_ip="203.0.113.10",
+                logger=logger,
+                retries=2,
+                interval_sec=0.0,
+                timeout_sec=1,
+            )
+        self.assertTrue(ok)
+
+    def test_wait_for_expected_public_ip_fail(self):
+        logger = setup_logger("", False)
+        with patch("hard_vless_client.get_public_ip", return_value="198.51.100.1"):
+            ok = wait_for_expected_public_ip(
+                expected_ip="203.0.113.10",
+                logger=logger,
+                retries=2,
+                interval_sec=0.0,
+                timeout_sec=1,
+            )
+        self.assertFalse(ok)
+
+class ParserTests(unittest.TestCase):
+    def test_connect_accepts_core_after_double_dash(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "connect",
+            "--protocol", "vless",
+            "--mode", "tun-system-proxy",
+            "--server-ip", "203.0.113.10",
+            "--server-port", "443",
+            "--uplink-iface", "eth0",
+            "--tunnel-iface", "tun0",
+            "--system-proxy-host", "127.0.0.1",
+            "--system-proxy-port", "1080",
+            "--", "sing-box", "run", "-c", "/etc/sing-box/config.json",
+        ])
+        self.assertEqual(normalize_core_cmd(args.core_cmd_positional), ["sing-box", "run", "-c", "/etc/sing-box/config.json"])
+
+
+
+class CoreAvailabilityTests(unittest.TestCase):
+    def test_missing_core_dry_run_no_auto_install(self):
+        logger = setup_logger("", False)
+        resolved = ensure_core_available(["sing-box", "run"], auto_install_core=False, dry_run=True, logger=logger)
+        self.assertEqual(resolved, "sing-box")
+
+    def test_auto_install_returns_installed_path(self):
+        logger = setup_logger("", False)
+        with patch("hard_vless_client.is_binary_available", side_effect=[False, False]):
+            with patch("hard_vless_client.install_sing_box", return_value=Path("/tmp/sing-box")):
+                resolved = ensure_core_available(["sing-box", "run"], auto_install_core=True, dry_run=False, logger=logger)
+        self.assertEqual(resolved, "/tmp/sing-box")
+
+class CoreDetectionTests(unittest.TestCase):
+    def test_core_binary_from_command(self):
+        self.assertEqual(core_binary_from_command(["sing-box", "run", "-c", "config.json"]), "sing-box")
+        self.assertIsNone(core_binary_from_command([]))
 
 @unittest.skipIf(PYQT_IMPORT_ERROR is not None, "PyQt6 is not installed in this environment")
 class UiRuntimeTests(unittest.TestCase):

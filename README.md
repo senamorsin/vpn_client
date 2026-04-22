@@ -25,6 +25,8 @@ This project provides a hardened controller around VPN/proxy cores (for example 
 - optional GNOME system proxy configuration (`gsettings`)
 - logging to stdout and file (`--log-file`)
 - cleanup on exit and disconnect helpers
+- optional auto-install for `sing-box` if missing (`--auto-install-core`)
+- default post-connect egress verification (`ifconfig.me`) to ensure observed public IP matches configured server IP
 
 ## Examples
 
@@ -42,6 +44,8 @@ sudo python3 hard_vless_client.py connect \
   --system-proxy-port 1080 \
   --force-default-route \
   --cleanup-on-exit \
+  --auto-install-core \
+  --verify-egress-ip \
   --log-file ./logs/client.log \
   -- sing-box run -c /etc/sing-box/config.json
 ```

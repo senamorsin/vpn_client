@@ -25,6 +25,8 @@ class ConnectOptions:
     dry_run: bool = False
     cleanup_on_exit: bool = False
     force_default_route: bool = True
+    auto_install_core: bool = True
+    verify_egress_ip: bool = True
     core_cmd: str = ""
 
 
@@ -57,6 +59,12 @@ def build_connect_command(options: ConnectOptions) -> list[str]:
         cmd.append("--force-default-route")
     if options.allow_lan.strip():
         cmd += ["--allow-lan", options.allow_lan.strip()]
+    if options.auto_install_core:
+        cmd.append("--auto-install-core")
+    if options.verify_egress_ip:
+        cmd.append("--verify-egress-ip")
+    else:
+        cmd.append("--no-verify-egress-ip")
 
     if options.mode in ("tun", "tun-system-proxy") and options.tunnel_iface.strip():
         cmd += ["--tunnel-iface", options.tunnel_iface.strip()]
@@ -207,11 +215,17 @@ if PYQT_IMPORT_ERROR is None:
             self.cleanup_chk = QCheckBox("Cleanup on exit")
             self.force_route_chk = QCheckBox("Force default route via TUN")
             self.force_route_chk.setChecked(True)
+            self.auto_install_chk = QCheckBox("Auto-install sing-box if missing")
+            self.auto_install_chk.setChecked(True)
+            self.verify_egress_chk = QCheckBox("Verify egress IP == server IP")
+            self.verify_egress_chk.setChecked(True)
             flags = QHBoxLayout()
             flags.addWidget(self.verbose_chk)
             flags.addWidget(self.dry_run_chk)
             flags.addWidget(self.cleanup_chk)
             flags.addWidget(self.force_route_chk)
+            flags.addWidget(self.auto_install_chk)
+            flags.addWidget(self.verify_egress_chk)
             flags.addStretch(1)
             form.addRow("Allow LAN CIDRs", self.allow_lan_edit)
             form.addRow("Log file", self.log_file_edit)
@@ -282,6 +296,8 @@ if PYQT_IMPORT_ERROR is None:
                 dry_run=self.dry_run_chk.isChecked(),
                 cleanup_on_exit=self.cleanup_chk.isChecked(),
                 force_default_route=self.force_route_chk.isChecked(),
+                auto_install_core=self.auto_install_chk.isChecked(),
+                verify_egress_ip=self.verify_egress_chk.isChecked(),
                 core_cmd=self.core_cmd_edit.text().strip(),
             )
             if not opts.server_ip:

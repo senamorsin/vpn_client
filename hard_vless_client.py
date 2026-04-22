@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import logging
 import os
+import platform
 import shlex
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -198,20 +204,29 @@ def run_command(cmd: list[str], dry_run: bool, logger: logging.Logger, ignore_er
     return True
 
 
-def get_default_routes(family: str) -> list[str]:
-    out = subprocess.run(
-        ["ip", family, "route", "show", "default"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def get_default_routes(family: str, logger: logging.Logger | None = None) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["ip", family, "route", "show", "default"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        if logger:
+            logger.warning("ip command not found; cannot read current %s default routes", family)
+        return []
     return [line.strip() for line in out.stdout.splitlines() if line.strip()]
 
 
 def force_default_route_to_tun(cfg: GuardConfig, dry_run: bool, logger: logging.Logger) -> tuple[list[str], list[str]]:
     """Force default traffic through TUN and return previous routes for rollback."""
-    saved_v4 = get_default_routes("-4")
-    saved_v6 = get_default_routes("-6")
+    if dry_run:
+        saved_v4 = []
+        saved_v6 = []
+    else:
+        saved_v4 = get_default_routes("-4", logger)
+        saved_v6 = get_default_routes("-6", logger)
 
     run_command(["ip", "-4", "route", "replace", "default", "dev", cfg.tunnel_iface], dry_run, logger)
     run_command(["ip", "-6", "route", "replace", "default", "dev", cfg.tunnel_iface], dry_run, logger, ignore_error=True)
@@ -266,7 +281,70 @@ def parse_lan(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
-def run_core(command: list[str], logger: logging.Logger) -> int:
+
+def get_public_ip(logger: logging.Logger, timeout_sec: int = 10) -> str | None:
+    try:
+        result = subprocess.run(
+            ["curl", "-fsS", "--max-time", str(timeout_sec), "ifconfig.me"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        logger.warning("curl not found; falling back to urllib for IP check")
+        try:
+            with urllib.request.urlopen("https://ifconfig.me", timeout=timeout_sec) as response:  # nosec B310
+                return response.read().decode().strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Public IP check failed via urllib: %s", exc)
+            return None
+
+    if result.returncode != 0:
+        logger.warning("Public IP check via curl failed: %s", result.stderr.strip())
+        return None
+
+    return result.stdout.strip()
+
+
+def wait_for_expected_public_ip(
+    expected_ip: str,
+    logger: logging.Logger,
+    retries: int = 10,
+    interval_sec: float = 2.0,
+    timeout_sec: int = 10,
+    proc: subprocess.Popen | None = None,
+) -> bool:
+    for attempt in range(1, retries + 1):
+        if proc is not None and proc.poll() is not None:
+            logger.error("Core process exited before public IP verification completed")
+            return False
+
+        observed = get_public_ip(logger=logger, timeout_sec=timeout_sec)
+        if observed == expected_ip:
+            logger.info("Public IP check passed: %s", observed)
+            return True
+
+        logger.warning(
+            "Public IP mismatch (attempt %s/%s): expected=%s observed=%s",
+            attempt,
+            retries,
+            expected_ip,
+            observed or "<unavailable>",
+        )
+        time.sleep(interval_sec)
+
+    return False
+
+
+def run_core(
+    command: list[str],
+    logger: logging.Logger,
+    verify_egress_ip: bool = False,
+    expected_ip: str = "",
+    verify_retries: int = 10,
+    verify_interval_sec: float = 2.0,
+    verify_timeout_sec: int = 10,
+) -> int:
     logger.info("Starting core: %s", shlex.join(command))
     proc = subprocess.Popen(command)
 
@@ -277,9 +355,142 @@ def run_core(command: list[str], logger: logging.Logger) -> int:
 
     signal.signal(signal.SIGINT, forward)
     signal.signal(signal.SIGTERM, forward)
+
+    if verify_egress_ip and expected_ip:
+        ok = wait_for_expected_public_ip(
+            expected_ip=expected_ip,
+            logger=logger,
+            retries=verify_retries,
+            interval_sec=verify_interval_sec,
+            timeout_sec=verify_timeout_sec,
+            proc=proc,
+        )
+        if not ok:
+            logger.error("Egress IP verification failed. VPN session will be terminated.")
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            return 2
+
     exit_code = proc.wait()
     logger.info("Core exited with code %s", exit_code)
     return exit_code
+
+
+
+def core_binary_from_command(command: list[str]) -> str | None:
+    if not command:
+        return None
+    return command[0]
+
+
+def is_binary_available(binary: str) -> bool:
+    if os.path.isabs(binary):
+        return os.path.exists(binary) and os.access(binary, os.X_OK)
+    return shutil_which(binary) is not None
+
+
+def _detect_singbox_asset() -> tuple[str, str]:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    os_map = {"linux": "linux", "darwin": "darwin"}
+    arch_map = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }
+
+    if system not in os_map:
+        raise RuntimeError(f"Unsupported OS for auto-install: {system}")
+    if machine not in arch_map:
+        raise RuntimeError(f"Unsupported architecture for auto-install: {machine}")
+
+    return os_map[system], arch_map[machine]
+
+
+def install_sing_box(dry_run: bool, logger: logging.Logger) -> Path:
+    os_name, arch = _detect_singbox_asset()
+    api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+
+    with urllib.request.urlopen(api_url, timeout=20) as response:  # nosec B310
+        release = json.load(response)
+
+    tag = release.get("tag_name")
+    if not tag:
+        raise RuntimeError("Could not determine latest sing-box release tag")
+
+    expected_suffix = f"{os_name}-{arch}.tar.gz"
+    assets = release.get("assets", [])
+    asset = next((a for a in assets if str(a.get("name", "")).endswith(expected_suffix)), None)
+    if not asset:
+        raise RuntimeError(f"No sing-box asset found for {expected_suffix}")
+
+    download_url = asset.get("browser_download_url")
+    if not download_url:
+        raise RuntimeError("Missing browser_download_url for sing-box asset")
+
+    target_dir = Path.home() / ".local" / "bin"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / "sing-box"
+
+    if dry_run:
+        logger.info("Dry-run: would install sing-box %s from %s to %s", tag, download_url, target_path)
+        print(f"install sing-box from {download_url} -> {target_path}")
+        return target_path
+
+    with tempfile.TemporaryDirectory(prefix="sing-box-install-") as tmp_dir:
+        archive_path = Path(tmp_dir) / "sing-box.tar.gz"
+        urllib.request.urlretrieve(download_url, archive_path)  # nosec B310
+
+        with tarfile.open(archive_path, "r:gz") as tar:
+            member = next((m for m in tar.getmembers() if m.name.endswith("/sing-box") or m.name == "sing-box"), None)
+            if member is None:
+                raise RuntimeError("sing-box binary not found in downloaded archive")
+            destination = (Path(tmp_dir) / member.name).resolve()
+            base = Path(tmp_dir).resolve()
+            if not str(destination).startswith(str(base)):
+                raise RuntimeError("Unsafe path in sing-box archive")
+            tar.extract(member, path=tmp_dir)
+            extracted = Path(tmp_dir) / member.name
+            extracted.chmod(0o755)
+            target_path.write_bytes(extracted.read_bytes())
+            target_path.chmod(0o755)
+
+    logger.info("Installed sing-box to %s", target_path)
+    return target_path
+
+
+def ensure_core_available(command: list[str], auto_install_core: bool, dry_run: bool, logger: logging.Logger) -> str:
+    binary = core_binary_from_command(command)
+    if not binary:
+        return ""
+
+    if is_binary_available(binary):
+        return binary
+
+    logger.warning("Core binary '%s' was not found in PATH", binary)
+    if dry_run and not auto_install_core:
+        logger.info("Dry-run: skipping hard failure for missing core binary %s", binary)
+        return binary
+    if not auto_install_core:
+        raise FileNotFoundError(
+            f"Core binary '{binary}' was not found. Install it or re-run with --auto-install-core."
+        )
+
+    if binary != "sing-box":
+        raise FileNotFoundError(
+            f"Auto-install is currently supported only for sing-box, got '{binary}'."
+        )
+
+    installed_path = install_sing_box(dry_run=dry_run, logger=logger)
+    if is_binary_available(binary):
+        return binary
+    return str(installed_path)
 
 
 def safety_warnings(cfg: GuardConfig, logger: logging.Logger) -> None:
@@ -307,6 +518,13 @@ def build_config(args: argparse.Namespace) -> GuardConfig:
     )
 
 
+
+def normalize_core_cmd(cmd: list[str]) -> list[str]:
+    if cmd and cmd[0] == "--":
+        return cmd[1:]
+    return cmd
+
+
 def cmd_connect(args: argparse.Namespace) -> int:
     logger = setup_logger(args.log_file, args.verbose)
     cfg = build_config(args)
@@ -326,12 +544,32 @@ def cmd_connect(args: argparse.Namespace) -> int:
     if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
         configure_system_proxy(cfg.system_proxy_host, cfg.system_proxy_port, args.dry_run, logger)
 
-    if not args.core_cmd:
+    core_cmd = args.core_cmd if args.core_cmd else args.core_cmd_positional
+    core_cmd = normalize_core_cmd(core_cmd)
+
+    if not core_cmd:
         logger.info("Guard applied; no core command specified")
         return 0
 
+    resolved_binary = ensure_core_available(core_cmd, args.auto_install_core, args.dry_run, logger)
+    if resolved_binary and core_cmd:
+        core_cmd[0] = resolved_binary
+
+    if args.dry_run:
+        logger.info("Dry-run: would run core command: %s", shlex.join(core_cmd))
+        print(shlex.join(core_cmd))
+        return 0
+
     try:
-        return run_core(args.core_cmd, logger)
+        return run_core(
+            core_cmd,
+            logger,
+            verify_egress_ip=args.verify_egress_ip,
+            expected_ip=cfg.server_ip,
+            verify_retries=args.verify_retries,
+            verify_interval_sec=args.verify_interval_sec,
+            verify_timeout_sec=args.verify_timeout_sec,
+        )
     finally:
         if args.cleanup_on_exit:
             if cfg.mode in (WorkMode.SYSTEM_PROXY, WorkMode.TUN_SYSTEM_PROXY):
@@ -392,10 +630,21 @@ def build_parser() -> argparse.ArgumentParser:
     connect.add_argument(
         "--core-cmd",
         nargs=argparse.REMAINDER,
-        help="Command for VPN core (prefix with --, e.g. -- sing-box run -c config.json)",
+        help="Command for VPN core (legacy form)",
+    )
+    connect.add_argument(
+        "core_cmd_positional",
+        nargs=argparse.REMAINDER,
+        help="Command for VPN core (preferred: append after --, e.g. -- sing-box run -c config.json)",
     )
     connect.add_argument("--cleanup-on-exit", action="store_true")
-    connect.set_defaults(func=cmd_connect)
+    connect.add_argument("--auto-install-core", action="store_true", help="Auto-install sing-box if missing")
+    connect.add_argument("--verify-egress-ip", dest="verify_egress_ip", action="store_true", help="Verify that public IP matches configured server IP")
+    connect.add_argument("--no-verify-egress-ip", dest="verify_egress_ip", action="store_false", help="Disable post-connect egress IP verification")
+    connect.add_argument("--verify-retries", type=int, default=10)
+    connect.add_argument("--verify-interval-sec", type=float, default=2.0)
+    connect.add_argument("--verify-timeout-sec", type=int, default=10)
+    connect.set_defaults(func=cmd_connect, verify_egress_ip=True)
 
     disconnect = sub.add_parser("disconnect", help="Remove guard and optional proxy")
     _add_global(disconnect)
